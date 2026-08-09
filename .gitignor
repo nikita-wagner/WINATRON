@@ -1,0 +1,8 @@
+# Ordner ignorieren (mit normalem Schrägstrich am Ende)
+bin32/
+bin64/
+exe32/
+exe64/
+
+# Alle Textdateien überall im Projekt ignorieren
+*.txt
