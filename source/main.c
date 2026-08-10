@@ -91,13 +91,25 @@ INT WINAPI wWinMain(
     }
 
 
-
+    con_init();
     while (1) { // Keep the program running until the user closes it
 
 
         if (input_key_pressed(VK_1_)) {
             play_tone(440.0, 0.5f); // Play A4 tone
             con_println_color(COL_WHITE, "Playing tone A4 (440 Hz).");
+        }
+        if (input_key_pressed(VK_2_)) {
+            play_tone(554.0, 0.6f); 
+            con_println_color(COL_GREEN, "Playing New Green");
+        }
+        if (input_key_pressed(VK_3_)) {
+            play_tone(666.0, 0.3f);
+            con_println_color(COL_RED, "Playing RedLine");
+        }
+        if (input_key_pressed(VK_4_)) {
+            stop_all_tones();
+            con_println_color(COL_BLUE, "KILLED TONE");
         }
 
         if (input_key_pressed(VK_ESCAPE_)) {
@@ -106,7 +118,7 @@ INT WINAPI wWinMain(
 
         Sleep(100); // Sleep to reduce CPU usage
     }
-
+    con_shutdown();
     audio_shutdown(); // Clean up audio system
 
 

@@ -30,7 +30,7 @@ for /f "usebackq eol=# tokens=1,* delims==" %%a in ("!CONFIG_FILE!") do (
 REM ── Toolchain and Language ────────────────────────────────────────────────
 set "TOOLCHAIN=msvc"
 if defined CFG_COMPILER set "TOOLCHAIN=!CFG_COMPILER!"
-set "LANG=c"
+set "LANG=c++"
 if defined CFG_LANGUAGE set "LANG=!CFG_LANGUAGE!"
 
 
