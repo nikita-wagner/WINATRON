@@ -3,6 +3,7 @@
 #include "InputManager/KeyboardInput.h"
 #include "ConsoleManager/Console.h"
 #include "ClockManager/Clock.h"
+#include "AudioManager/Audio.h"
 // Development points.
 // Using only WinAPI functions for the compatibility with Windows operating systems
 // Using SAL2 for better code analysis and documentation of function parameters
@@ -81,7 +82,32 @@ INT WINAPI wWinMain(
     Sleep(1000); // Optional: wait a moment before closing to see the final message
 
 
+    BOOL audio_init_success = audio_init();
+    if (!audio_init_success) {
+        con_println_color(COL_RED, "Audio system failed to initialize.");
+        return 1;
+    } else {
+        con_println_color(COL_GREEN, "Audio system initialized successfully.");
+    }
 
+
+
+    while (1) { // Keep the program running until the user closes it
+
+
+        if (input_key_pressed(VK_1_)) {
+            play_tone(440.0, 0.5f); // Play A4 tone
+            con_println_color(COL_WHITE, "Playing tone A4 (440 Hz).");
+        }
+
+        if (input_key_pressed(VK_ESCAPE_)) {
+            break; // Exit the loop if Escape key is pressed
+        }
+
+        Sleep(100); // Sleep to reduce CPU usage
+    }
+
+    audio_shutdown(); // Clean up audio system
 
 
 
