@@ -4,6 +4,7 @@
 #include "ConsoleManager/Console.h"
 #include "ClockManager/Clock.h"
 #include "AudioManager/Audio.h"
+#include "AudioManager/Piano.h"
 // Development points.
 // Using only WinAPI functions for the compatibility with Windows operating systems
 // Using SAL2 for better code analysis and documentation of function parameters
@@ -38,7 +39,7 @@ INT WINAPI wWinMain(
     // Option 6: REALTIME (use with caution - can freeze system)
     // SetPriorityClass(GetCurrentProcess(), REALTIME_PRIORITY_CLASS);
     
-    GDI_GRAPHICS_TEST(hInstance);
+    // GDI_GRAPHICS_TEST(hInstance);
     
 
 
@@ -79,7 +80,7 @@ INT WINAPI wWinMain(
 
 
 
-    Sleep(1000); // Optional: wait a moment before closing to see the final message
+    // Sleep(1000); // Optional: wait a moment before closing to see the final message
 
 
     BOOL audio_init_success = audio_init();
@@ -95,22 +96,7 @@ INT WINAPI wWinMain(
     while (1) { // Keep the program running until the user closes it
 
 
-        if (input_key_pressed(VK_1_)) {
-            play_tone(440.0, 0.5f); // Play A4 tone
-            con_println_color(COL_WHITE, "Playing tone A4 (440 Hz).");
-        }
-        if (input_key_pressed(VK_2_)) {
-            play_tone(554.0, 0.6f); 
-            con_println_color(COL_GREEN, "Playing New Green");
-        }
-        if (input_key_pressed(VK_3_)) {
-            play_tone(666.0, 0.3f);
-            con_println_color(COL_RED, "Playing RedLine");
-        }
-        if (input_key_pressed(VK_4_)) {
-            stop_all_tones();
-            con_println_color(COL_BLUE, "KILLED TONE");
-        }
+        PlayPiano();
 
         if (input_key_pressed(VK_ESCAPE_)) {
             break; // Exit the loop if Escape key is pressed

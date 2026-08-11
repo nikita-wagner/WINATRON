@@ -1,5 +1,8 @@
+#pragma once
 #define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
+#include <stdarg.h>
+#include <stdio.h>
 
 // Test
 // ─── Virtual Key Codes ────────────────────────────────────────────────────────
@@ -105,8 +108,7 @@
 #define VK_SCROLLLOCK_   0x91
 
 
-// Is a specific key currently held down?
-BOOL input_key_held(int vk) {
+int input_key_held(int vk) {
     return (GetAsyncKeyState(vk) & 0x8000) != 0;
 }
 
@@ -128,4 +130,32 @@ BOOL input_keys_held(int count, ...) {
     }
     va_end(args);
     return TRUE;
+}
+
+
+void input_print_keys(void) {
+    printf("Held keys:");
+    // Check printable range + common special keys
+    for (int vk = 0x08; vk <= 0xFF; vk++) {
+        if (input_key_held(vk)) {
+            // Try to print a readable name for common keys
+            if (vk >= 0x41 && vk <= 0x5A)      printf(" %c", vk);        // A-Z
+            else if (vk >= 0x30 && vk <= 0x39)  printf(" %c", vk);        // 0-9
+            else if (vk == 0x20) printf(" SPACE");
+            else if (vk == 0x0D) printf(" ENTER");
+            else if (vk == 0x1B) printf(" ESC");
+            else if (vk == 0x09) printf(" TAB");
+            else if (vk == 0x10) printf(" SHIFT");
+            else if (vk == 0x11) printf(" CTRL");
+            else if (vk == 0x12) printf(" ALT");
+            else if (vk == 0x08) printf(" BKSP");
+            else if (vk == 0x25) printf(" LEFT");
+            else if (vk == 0x26) printf(" UP");
+            else if (vk == 0x27) printf(" RIGHT");
+            else if (vk == 0x28) printf(" DOWN");
+            else if (vk >= 0x70 && vk <= 0x7B) printf(" F%d", vk - 0x6F);
+            else printf(" 0x%02X", vk);
+        }
+    }
+    printf("\n");
 }

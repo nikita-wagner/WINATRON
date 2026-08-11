@@ -473,7 +473,7 @@ if not defined DET32 if not defined DET64 (
 >> "!CF!" echo #  Leave empty (with SOURCE_FOLDERS also empty) to auto-detect
 >> "!CF!" echo #  by recursively searching this directory for .cpp/.c files.
 >> "!CF!" echo #  Example: TRAINING\poly.cpp CHAPTER_1\cpC.cpp
->> "!CF!" echo SOURCE_FILES=
+>> "!CF!" echo SOURCE_FILES=source/main.c
 >> "!CF!" echo.
 >> "!CF!" echo.
 >> "!CF!" echo.
