@@ -7,6 +7,18 @@
 //    Every WAV function also accepts the bare 0..99 slot for compatibility.
 //    angle_of_tone / reverb_tone dispatch on the ID: 0..99 = tone, 100+ = WAV.
 //
+//  Voice phase alignment:
+//    Tones always begin at the top of a mix buffer, so any two presses are an
+//    integer number of 2205-frame buffers apart. Starting every voice at
+//    phase 0 therefore gave them a phase difference of 2*PI*f*n/20, which is a
+//    multiple of 2*PI only when f is a multiple of 20 Hz. That is why 440,
+//    880, 739.99 and 1479.98 stacked cleanly while every other note beat
+//    against its own copies and sounded like it was stuttering.
+//    Phase lock (on by default, see set_tone_phase_lock) derives the start
+//    phase from the absolute frame index instead, making voices of any
+//    frequency coherent. play_tone_at_buffer_pos() and friends expose the
+//    sub-buffer start offset directly for deliberate timing work.
+//
 //  Remaster notes (behavior fixes vs. the original):
 //    • REVERB_BUF_LEN macro was unparenthesized, so "% REVERB_BUF_LEN"
 //      expanded to "(x % 2205) * 4" — the reverb read/write index jumped
@@ -55,13 +67,6 @@
 #include <immintrin.h>
 #include <intrin.h>
 
-#ifndef true
-#define true 1
-#endif
-#ifndef false
-#define false 0
-#endif
-
 #define SAMPLE_RATE     44100
 #define AMPLITUDE       50000            // tone full-scale: gain 1.0 peaks at ~32500 after panning (no clipping)
 #define NUM_BUFFERS     3
@@ -75,7 +80,6 @@
 #define ANGLE_TO_RADIANS(angle)   ((angle) * PI / 180.0)
 #define RADIANS_TO_ANGLE(radians) ((radians) * 180.0 / PI)
 
-#pragma comment(lib, "winmm.lib")
 
 // ─── Fade / lifecycle states ─────────────────────────────────────────────────
 
@@ -175,6 +179,23 @@ typedef struct {
 
 static AudioSystem g_audioSystem = {0};
 
+// ─── Global mix clock & phase lock ───────────────────────────────────────────
+// g_mix_clock is the absolute frame index of the next buffer to be mixed.
+// Only ever read/written while holding toneLock.
+//
+// Phase lock (on by default) derives a new tone's start phase from that
+// absolute index instead of always starting at 0. Without it, every tone
+// starts at sample 0 of some buffer with phase 0, so two presses of the same
+// note are an integer number of 2205-sample buffers apart and their phase
+// difference is 2*PI*f*n/20 — a multiple of 2*PI only when f is a multiple of
+// 20 Hz. That is why 440 / 880 / 739.99 / 1479.98 stack cleanly and every
+// other note beats against itself and appears to stutter as presses pile up.
+// With phase lock, voice phase is a function of absolute time, so voices of
+// the same frequency are coherent no matter which buffer they started in.
+
+static LONG64 g_mix_clock       = 0;
+static BOOL   g_tone_phase_lock = TRUE;
+
 // ─── Reverb side arrays ──────────────────────────────────────────────────────
 // Kept out of Tone/WavSound so the structs stay small. Only the audio thread
 // touches the buffer contents; play-time resets happen under the same lock
@@ -190,7 +211,7 @@ static int   reverb_idx_wav  [MAX_WAV_SOUNDS];
 
 #define SINE_TABLE_SIZE 1024
 static float sine_table[SINE_TABLE_SIZE];
-static BOOL  sine_table_initialized = false;
+static BOOL  sine_table_initialized = FALSE;
 
 // Precomputed scale: fast_sin is one multiply + mask, no divide/floor.
 static const double SINE_SCALE = (double)SINE_TABLE_SIZE / (2.0 * PI);
@@ -199,7 +220,7 @@ static void init_sine_table(void) {
     if (sine_table_initialized) return;
     for (int i = 0; i < SINE_TABLE_SIZE; i++)
         sine_table[i] = (float)sin(2.0 * PI * i / SINE_TABLE_SIZE);
-    sine_table_initialized = true;
+    sine_table_initialized = TRUE;
 }
 
 // Callers keep phase in [0, 2π); the mask makes stray values safe anyway.
@@ -244,7 +265,7 @@ static inline float tick_fade_in(int* counter, int duration, int* state) {
 static inline float tick_fade_out(int* counter, int duration, BOOL* active) {
     float env = 1.0f - (float)(*counter) / (float)duration;
     (*counter)++;
-    if (env <= 0.0f) { *active = false; return -1.0f; }
+    if (env <= 0.0f) { *active = FALSE; return -1.0f; }
     return env;
 }
 
@@ -284,7 +305,7 @@ static void init_sound_common(Tone* sound, int slot,
     sound->angle                    = 0.0f;
     sound->left_amp                 = 1.0f;
     sound->right_amp                = 1.0f;
-    sound->active                   = true;
+    sound->active                   = TRUE;
     sound->fade_state               = FADE_IN;
     sound->fade_counter             = 0;
     sound->fade_duration            = FADE_SAMPLES;
@@ -292,11 +313,11 @@ static void init_sound_common(Tone* sound, int slot,
     sound->timer_counter            = 0;
     sound->delay_samples            = 0;
     sound->delay_counter            = 0;
-    sound->is_timed_after_delay     = false;
+    sound->is_timed_after_delay     = FALSE;
     sound->delayed_duration_seconds = 0.0;
     sound->reverb_amount            = 0.0f;
     sound->reverb_decay             = 0.5f;
-    sound->paused                   = false;
+    sound->paused                   = FALSE;
 
     memset(reverb_bufs_tone[slot], 0, REVERB_BUF_LEN * sizeof(short));
     reverb_idx_tone[slot] = 0;
@@ -311,8 +332,8 @@ static void init_wav_sound_common(WavSound* sound, int slot,
     sound->angle                    = 0.0f;
     sound->left_amp                 = 1.0f;
     sound->right_amp                = 1.0f;
-    sound->active                   = true;
-    sound->repeat                   = false;
+    sound->active                   = TRUE;
+    sound->repeat                   = FALSE;
     sound->fade_state               = FADE_IN;
     sound->fade_counter             = 0;
     sound->fade_duration            = FADE_SAMPLES;
@@ -320,14 +341,14 @@ static void init_wav_sound_common(WavSound* sound, int slot,
     sound->timer_counter            = 0;
     sound->delay_samples            = 0;
     sound->delay_counter            = 0;
-    sound->is_timed_after_delay     = false;
+    sound->is_timed_after_delay     = FALSE;
     sound->delayed_duration_seconds = 0.0;
     sound->reverb_amount            = 0.0f;
     sound->reverb_decay             = 0.5f;
     sound->loop_start_sample        = 0;
     sound->loop_end_sample          = 0;
     sound->pitch                    = 1.0f;
-    sound->paused                   = false;
+    sound->paused                   = FALSE;
 
     memset(reverb_bufs_wav[slot], 0, REVERB_BUF_LEN * sizeof(short));
     reverb_idx_wav[slot] = 0;
@@ -370,6 +391,12 @@ static void audio_mixer(short* buffer, int buffer_size) {
 
     // ── Tone sounds ──────────────────────────────────────────────────────────
     EnterCriticalSection(&g_audioSystem.toneLock);
+
+    // Advance the mix clock while holding the lock. A play_* call blocked on
+    // the lock resumes with g_mix_clock already pointing at the buffer its
+    // tone will actually land in, so phase-locked starts are exact.
+    g_mix_clock += buffer_size;
+
     for (int v = 0; v < MAX_TONE_SOUNDS; v++) {
         Tone* tone = &g_audioSystem.tone[v];
         if (!tone->active || tone->paused) continue;
@@ -423,7 +450,7 @@ static void audio_mixer(short* buffer, int buffer_size) {
         if (!s->active) continue;
 
         WAV* wd = s->wav_data;
-        if (!wd || !wd->loaded || !wd->data) { s->active = false; continue; }
+        if (!wd || !wd->loaded || !wd->data) { s->active = FALSE; continue; }
         if (s->paused) continue;
 
         int start_i = 0;
@@ -454,9 +481,9 @@ static void audio_mixer(short* buffer, int buffer_size) {
                     }
                     s->loop_end_sample = 0;
                     end_frame          = wd->sample_count;
-                    if (s->current_position >= end_frame) { s->active = false; break; }
+                    if (s->current_position >= end_frame) { s->active = FALSE; break; }
                 } else {
-                    s->active = false;
+                    s->active = FALSE;
                     break;
                 }
             }
@@ -549,7 +576,7 @@ void unload_all_WAVs(void);
 
 BOOL audio_init(void) {
     if (g_audioSystem.initialized)
-        return true;
+        return TRUE;
 
     memset(&g_audioSystem, 0, sizeof(AudioSystem));
 
@@ -569,7 +596,7 @@ BOOL audio_init(void) {
     if (result != MMSYSERR_NOERROR) {
         DeleteCriticalSection(&g_audioSystem.toneLock);
         DeleteCriticalSection(&g_audioSystem.wavLock);
-        return false;
+        return FALSE;
     }
 
     for (int i = 0; i < NUM_BUFFERS; i++) {
@@ -604,29 +631,29 @@ BOOL audio_init(void) {
 
     init_sine_table();
 
-    g_audioSystem.initialized = true;
-    g_audioSystem.running     = true;
+    g_audioSystem.initialized = TRUE;
+    g_audioSystem.running     = TRUE;
 
     g_audioSystem.audioThread = CreateThread(NULL, 0, audio_thread_proc, NULL, 0, NULL);
     if (g_audioSystem.audioThread == NULL) {
-        g_audioSystem.initialized = false;
-        g_audioSystem.running     = false;
+        g_audioSystem.initialized = FALSE;
+        g_audioSystem.running     = FALSE;
         waveOutClose(g_audioSystem.hWaveOut);
         DeleteCriticalSection(&g_audioSystem.toneLock);
         DeleteCriticalSection(&g_audioSystem.wavLock);
-        return false;
+        return FALSE;
     }
     // keep buffer refills punctual even when the main thread is busy
     SetThreadPriority(g_audioSystem.audioThread, THREAD_PRIORITY_TIME_CRITICAL);
 
-    return true;
+    return TRUE;
 }
 
 void audio_shutdown(void) {
     if (!g_audioSystem.initialized)
         return;
 
-    g_audioSystem.running = false;
+    g_audioSystem.running = FALSE;
     if (g_audioSystem.audioThread != NULL) {
         WaitForSingleObject(g_audioSystem.audioThread, 2000);
         CloseHandle(g_audioSystem.audioThread);
@@ -647,7 +674,7 @@ void audio_shutdown(void) {
     DeleteCriticalSection(&g_audioSystem.toneLock);
     DeleteCriticalSection(&g_audioSystem.wavLock);
 
-    g_audioSystem.initialized = false;
+    g_audioSystem.initialized = FALSE;
 }
 
 // ─── Tone API ────────────────────────────────────────────────────────────────
@@ -661,76 +688,148 @@ static int acquire_tone_slot(int id) {
     return -1;
 }
 
-int play_tone(double frequency, float gain) {
+// Must be called with toneLock held.
+// Derives the start phase from the absolute frame index at which the tone
+// first becomes audible, so every voice of a given frequency is coherent no
+// matter which buffer it was started in. `phase` is then an offset on top of
+// that. With phase lock off, `phase` is used verbatim (pre-remaster behavior).
+static double tone_start_phase(double frequency, double phase, int delay_samples) {
+    if (!g_tone_phase_lock) return phase;
+    double cycles = frequency * (double)(g_mix_clock + delay_samples) / (double)SAMPLE_RATE;
+    cycles -= floor(cycles);            // keep the fraction; init_sound_common wraps
+    return phase + 2.0 * PI * cycles;
+}
+
+// Clamp a caller-supplied position to a valid offset inside one mix buffer.
+static inline int clamp_buffer_pos(int buffer_pos) {
+    if (buffer_pos < 0)            return 0;
+    if (buffer_pos >= BUFFER_SIZE) return BUFFER_SIZE - 1;
+    return buffer_pos;
+}
+
+// Single entry point behind every play_*_tone function.
+//   delay_samples : frames of silence before the tone is audible — this is
+//                   where both start delays and buffer alignment land.
+//   timed         : fade out after duration_seconds of audible playback.
+static int tone_start(int id, double frequency, float amplitude, double phase,
+                      BOOL timed, double duration_seconds, int delay_samples) {
     if (!g_audioSystem.initialized) return -1;
+    if (delay_samples < 0) delay_samples = 0;
 
     EnterCriticalSection(&g_audioSystem.toneLock);
-    int slot = acquire_tone_slot(-1);
-    if (slot >= 0)
-        init_sound_common(&g_audioSystem.tone[slot], slot, frequency, gain, 0.0);
+
+    int slot = acquire_tone_slot(id);
+    if (slot >= 0) {
+        Tone* t = &g_audioSystem.tone[slot];
+        init_sound_common(t, slot, frequency, amplitude,
+                          tone_start_phase(frequency, phase, delay_samples));
+
+        if (delay_samples > 0) {
+            t->fade_state               = FADE_DELAY;
+            t->delay_samples            = delay_samples;
+            t->is_timed_after_delay     = timed;
+            t->delayed_duration_seconds = duration_seconds;
+        } else if (timed) {
+            t->fade_state    = FADE_TIMED;
+            t->timer_samples = (int)(duration_seconds * SAMPLE_RATE);
+        }
+    }
+
     LeaveCriticalSection(&g_audioSystem.toneLock);
     return slot;
+}
+
+int play_tone(double frequency, float gain) {
+    return tone_start(-1, frequency, gain, 0.0, FALSE, 0.0, 0);
 }
 
 int play_tone_by_duration(int id, double frequency, float amplitude, double phase, double duration_seconds) {
-    if (!g_audioSystem.initialized) return -1;
-
-    EnterCriticalSection(&g_audioSystem.toneLock);
-    int slot = acquire_tone_slot(id);
-    if (slot >= 0) {
-        Tone* sound = &g_audioSystem.tone[slot];
-        init_sound_common(sound, slot, frequency, amplitude, phase);
-        sound->fade_state    = FADE_TIMED;
-        sound->timer_samples = (int)(duration_seconds * SAMPLE_RATE);
-    }
-    LeaveCriticalSection(&g_audioSystem.toneLock);
-    return slot;
+    return tone_start(id, frequency, amplitude, phase, TRUE, duration_seconds, 0);
 }
 
 int play_static_tone(int id, double frequency, float amplitude, double phase) {
-    if (!g_audioSystem.initialized) return -1;
-
-    EnterCriticalSection(&g_audioSystem.toneLock);
-    int slot = acquire_tone_slot(id);
-    if (slot >= 0)
-        init_sound_common(&g_audioSystem.tone[slot], slot, frequency, amplitude, phase);
-    LeaveCriticalSection(&g_audioSystem.toneLock);
-    return slot;
+    return tone_start(id, frequency, amplitude, phase, FALSE, 0.0, 0);
 }
 
 int play_delayed_tone_by_duration(int id, double frequency, float amplitude, double phase,
                                   double duration_seconds, double start_delay_seconds) {
-    if (!g_audioSystem.initialized) return -1;
-
-    EnterCriticalSection(&g_audioSystem.toneLock);
-    int slot = acquire_tone_slot(id);
-    if (slot >= 0) {
-        Tone* sound = &g_audioSystem.tone[slot];
-        init_sound_common(sound, slot, frequency, amplitude, phase);
-        sound->fade_state               = FADE_DELAY;
-        sound->delay_samples            = (int)(start_delay_seconds * SAMPLE_RATE);
-        sound->is_timed_after_delay     = true;
-        sound->delayed_duration_seconds = duration_seconds;
-    }
-    LeaveCriticalSection(&g_audioSystem.toneLock);
-    return slot;
+    return tone_start(id, frequency, amplitude, phase, TRUE, duration_seconds,
+                      (int)(start_delay_seconds * SAMPLE_RATE));
 }
 
 int play_delayed_static_tone(int id, double frequency, float amplitude, double phase,
                              double start_delay_seconds) {
-    if (!g_audioSystem.initialized) return -1;
+    return tone_start(id, frequency, amplitude, phase, FALSE, 0.0,
+                      (int)(start_delay_seconds * SAMPLE_RATE));
+}
 
+// ─── Buffer-aligned tone starts ──────────────────────────────────────────────
+// buffer_pos is a frame offset inside the 50 ms mix buffer (0 .. BUFFER_SIZE-1)
+// at which the tone begins. 0 reproduces the plain play_* functions (top of the
+// next buffer); BUFFER_SIZE/2 starts it 25 ms later, and so on. Out-of-range
+// values are clamped. On the delayed variants it is added to the start delay,
+// giving sub-buffer resolution on top of the coarse seconds value.
+//
+// What this does and does not fix: with phase lock on (the default) the start
+// phase already comes from absolute time, so voices of the same frequency never
+// beat against each other regardless of buffer_pos — use these for deliberate
+// sub-buffer timing (strums, flams, tight stereo spreads). With phase lock off,
+// buffer_pos becomes the manual alignment knob you asked for: an offset of k
+// shifts the start phase by 2*PI*f*k/SAMPLE_RATE.
+
+int play_tone_at_buffer_pos(double frequency, float gain, int buffer_pos) {
+    return tone_start(-1, frequency, gain, 0.0, FALSE, 0.0, clamp_buffer_pos(buffer_pos));
+}
+
+int play_static_tone_at_buffer_pos(int id, double frequency, float amplitude, double phase,
+                                   int buffer_pos) {
+    return tone_start(id, frequency, amplitude, phase, FALSE, 0.0, clamp_buffer_pos(buffer_pos));
+}
+
+int play_tone_at_buffer_pos_by_duration(int id, double frequency, float amplitude, double phase,
+                                        double duration_seconds, int buffer_pos) {
+    return tone_start(id, frequency, amplitude, phase, TRUE, duration_seconds,
+                      clamp_buffer_pos(buffer_pos));
+}
+
+int play_delayed_static_tone_at_buffer_pos(int id, double frequency, float amplitude, double phase,
+                                           double start_delay_seconds, int buffer_pos) {
+    return tone_start(id, frequency, amplitude, phase, FALSE, 0.0,
+                      (int)(start_delay_seconds * SAMPLE_RATE) + clamp_buffer_pos(buffer_pos));
+}
+
+int play_delayed_tone_at_buffer_pos_by_duration(int id, double frequency, float amplitude, double phase,
+                                                double duration_seconds, double start_delay_seconds,
+                                                int buffer_pos) {
+    return tone_start(id, frequency, amplitude, phase, TRUE, duration_seconds,
+                      (int)(start_delay_seconds * SAMPLE_RATE) + clamp_buffer_pos(buffer_pos));
+}
+
+// ─── Phase lock control ──────────────────────────────────────────────────────
+// On (default): a tone's start phase is derived from absolute sample time, so
+// repeated presses of the same note always stack coherently. Off: tones start
+// at exactly the `phase` argument — the pre-remaster behavior, and what you
+// want if you are driving phase yourself via buffer_pos.
+
+void set_tone_phase_lock(BOOL enabled) {
+    if (!g_audioSystem.initialized) { g_tone_phase_lock = enabled ? TRUE : FALSE; return; }
     EnterCriticalSection(&g_audioSystem.toneLock);
-    int slot = acquire_tone_slot(id);
-    if (slot >= 0) {
-        Tone* sound = &g_audioSystem.tone[slot];
-        init_sound_common(sound, slot, frequency, amplitude, phase);
-        sound->fade_state           = FADE_DELAY;
-        sound->delay_samples        = (int)(start_delay_seconds * SAMPLE_RATE);
-        sound->is_timed_after_delay = false;
-    }
+    g_tone_phase_lock = enabled ? TRUE : FALSE;
     LeaveCriticalSection(&g_audioSystem.toneLock);
-    return slot;
+}
+
+BOOL get_tone_phase_lock(void) {
+    return g_tone_phase_lock;
+}
+
+// Absolute frame index of the next buffer to be mixed. Useful for lining
+// several tones up on the same sample boundary.
+LONG64 audio_sample_clock(void) {
+    if (!g_audioSystem.initialized) return 0;
+    EnterCriticalSection(&g_audioSystem.toneLock);
+    LONG64 clock = g_mix_clock;
+    LeaveCriticalSection(&g_audioSystem.toneLock);
+    return clock;
 }
 
 void stop_tone(int sound_id) {
@@ -740,8 +839,8 @@ void stop_tone(int sound_id) {
     Tone* sound = &g_audioSystem.tone[sound_id];
     if (sound->active) {
         if (sound->fade_state == FADE_DELAY || sound->paused) {
-            sound->active = false;      // silent right now — no fade needed
-            sound->paused = false;
+            sound->active = FALSE;      // silent right now — no fade needed
+            sound->paused = FALSE;
         } else if (sound->fade_state != FADE_OUT) {
             sound->fade_state   = FADE_OUT;
             sound->fade_counter = 0;
@@ -758,8 +857,8 @@ void stop_all_tones(void) {
         Tone* sound = &g_audioSystem.tone[i];
         if (!sound->active) continue;
         if (sound->fade_state == FADE_DELAY || sound->paused) {
-            sound->active = false;
-            sound->paused = false;
+            sound->active = FALSE;
+            sound->paused = FALSE;
         } else if (sound->fade_state != FADE_OUT) {
             sound->fade_state   = FADE_OUT;
             sound->fade_counter = 0;
@@ -833,7 +932,7 @@ void pause_tone(int id) {
     if (!g_audioSystem.initialized || id < 0 || id >= MAX_TONE_SOUNDS) return;
     EnterCriticalSection(&g_audioSystem.toneLock);
     if (g_audioSystem.tone[id].active)
-        g_audioSystem.tone[id].paused = true;
+        g_audioSystem.tone[id].paused = TRUE;
     LeaveCriticalSection(&g_audioSystem.toneLock);
 }
 
@@ -841,7 +940,7 @@ void resume_tone(int id) {
     if (!g_audioSystem.initialized || id < 0 || id >= MAX_TONE_SOUNDS) return;
     EnterCriticalSection(&g_audioSystem.toneLock);
     if (g_audioSystem.tone[id].active)
-        g_audioSystem.tone[id].paused = false;
+        g_audioSystem.tone[id].paused = FALSE;
     LeaveCriticalSection(&g_audioSystem.toneLock);
 }
 
@@ -873,7 +972,7 @@ void set_fade_duration_tone(int id, int samples) {
 
 BOOL check_active_tone(int id) {
     // Returns true while a sound is fading out (still audible) — intentional.
-    if (!g_audioSystem.initialized || id < 0 || id >= MAX_TONE_SOUNDS) return false;
+    if (!g_audioSystem.initialized || id < 0 || id >= MAX_TONE_SOUNDS) return FALSE;
     EnterCriticalSection(&g_audioSystem.toneLock);
     BOOL playing = g_audioSystem.tone[id].active;
     LeaveCriticalSection(&g_audioSystem.toneLock);
@@ -916,8 +1015,8 @@ typedef struct {
 } CpuFeatures;
 
 static inline CpuFeatures detect_cpu_features(void) {
-    static CpuFeatures f = {false, false, false, false, false};
-    static BOOL cached   = false;
+    static CpuFeatures f = {FALSE, FALSE, FALSE, FALSE, FALSE};
+    static BOOL cached   = FALSE;
     if (cached) return f;
 
     int info[4];
@@ -929,7 +1028,7 @@ static inline CpuFeatures detect_cpu_features(void) {
     BOOL osxsave = (info[2] & (1 << 27)) != 0;
     BOOL avx_ecx = (info[2] & (1 << 28)) != 0;
 
-    if (!osxsave || !avx_ecx) { cached = true; return f; }
+    if (!osxsave || !avx_ecx) { cached = TRUE; return f; }
 
     UINT64 xcr0 = _xgetbv(0);
     BOOL ymm_ok = (xcr0 & 0x06) == 0x06;
@@ -944,7 +1043,7 @@ static inline CpuFeatures detect_cpu_features(void) {
         f.avx512vbmi = f.avx512f && ((info[2] & (1 << 1)) != 0);
     }
 
-    cached = true;
+    cached = TRUE;
     return f;
 }
 
@@ -1197,17 +1296,17 @@ static WAV* find_wav_data(const char* filename) {
 // All file I/O and sample conversion happen OUTSIDE the lock so loading a
 // file never stalls the audio thread.
 BOOL load_WAV(const char* filename) {
-    if (!g_audioSystem.initialized) return false;
+    if (!g_audioSystem.initialized) return FALSE;
 
     // Quick check: already cached?
     EnterCriticalSection(&g_audioSystem.wavLock);
     if (find_wav_data(filename)) {
         LeaveCriticalSection(&g_audioSystem.wavLock);
-        return true;
+        return TRUE;
     }
     if (g_audioSystem.wav_cache_count >= MAX_WAV_CACHE) {
         LeaveCriticalSection(&g_audioSystem.wavLock);
-        return false;
+        return FALSE;
     }
     LeaveCriticalSection(&g_audioSystem.wavLock);
 
@@ -1216,17 +1315,17 @@ BOOL load_WAV(const char* filename) {
     snprintf(full_path, sizeof(full_path), "source/sound/%s", filename);
 
     FILE* file = fopen(full_path, "rb");
-    if (!file) return false;
+    if (!file) return FALSE;
 
     RiffHeader riff;
     if (fread(&riff, sizeof(RiffHeader), 1, file) != 1 ||
         strncmp(riff.riff, "RIFF", 4) != 0 ||
         strncmp(riff.wave, "WAVE", 4) != 0) {
-        fclose(file); return false;
+        fclose(file); return FALSE;
     }
 
     FmtChunk       fmt      = {0};
-    BOOL           got_fmt  = false;
+    BOOL           got_fmt  = FALSE;
     unsigned char* raw_data = NULL;
     UINT32         data_size = 0;
 
@@ -1237,12 +1336,12 @@ BOOL load_WAV(const char* filename) {
             if (fread(&fmt, read_size, 1, file) != 1) break;
             if (chunk.size > sizeof(FmtChunk))
                 fseek(file, (long)(chunk.size - sizeof(FmtChunk) + (chunk.size & 1)), SEEK_CUR);
-            got_fmt = true;
+            got_fmt = TRUE;
         } else if (strncmp(chunk.id, "data", 4) == 0) {
             data_size = chunk.size;
             raw_data  = (unsigned char*)malloc(data_size);
             if (!raw_data || fread(raw_data, data_size, 1, file) != 1) {
-                free(raw_data); fclose(file); return false;
+                free(raw_data); fclose(file); return FALSE;
             }
             break;
         } else {
@@ -1252,18 +1351,18 @@ BOOL load_WAV(const char* filename) {
     }
     fclose(file);
 
-    if (!got_fmt || !raw_data)                                          { free(raw_data); return false; }
-    if (fmt.format != WAVE_FMT_PCM && fmt.format != WAVE_FMT_EXTENSIBLE){ free(raw_data); return false; }
-    if (fmt.channels < 1 || fmt.channels > 2)                           { free(raw_data); return false; }
+    if (!got_fmt || !raw_data)                                          { free(raw_data); return FALSE; }
+    if (fmt.format != WAVE_FMT_PCM && fmt.format != WAVE_FMT_EXTENSIBLE){ free(raw_data); return FALSE; }
+    if (fmt.channels < 1 || fmt.channels > 2)                           { free(raw_data); return FALSE; }
     if (fmt.bits_per_sample != 8  && fmt.bits_per_sample != 16 &&
-        fmt.bits_per_sample != 24 && fmt.bits_per_sample != 32)         { free(raw_data); return false; }
+        fmt.bits_per_sample != 24 && fmt.bits_per_sample != 32)         { free(raw_data); return FALSE; }
 
     int bytes_per_sample = fmt.bits_per_sample / 8;
     int sample_count     = (int)(data_size / (fmt.channels * bytes_per_sample));
     int total_samples    = sample_count * fmt.channels;
 
     short* wav_data = (short*)malloc((size_t)total_samples * sizeof(short));
-    if (!wav_data) { free(raw_data); return false; }
+    if (!wav_data) { free(raw_data); return FALSE; }
 
     // Conversion dispatches to the best available SIMD tier (AVX2 > SSE2 > scalar)
     if (fmt.bits_per_sample == 8) {
@@ -1284,7 +1383,7 @@ BOOL load_WAV(const char* filename) {
     if (find_wav_data(filename)) {
         LeaveCriticalSection(&g_audioSystem.wavLock);
         free(wav_data);
-        return true;
+        return TRUE;
     }
 
     // Reuse the first free slot. Slots are never compacted, so WavSound
@@ -1296,7 +1395,7 @@ BOOL load_WAV(const char* filename) {
     if (!wd) {
         LeaveCriticalSection(&g_audioSystem.wavLock);
         free(wav_data);
-        return false;
+        return FALSE;
     }
 
     wd->data         = wav_data;
@@ -1304,11 +1403,11 @@ BOOL load_WAV(const char* filename) {
     wd->channels     = fmt.channels;
     wd->sample_rate  = (int)fmt.sample_rate;
     strncpy_s(wd->filename, sizeof(wd->filename), filename, _TRUNCATE);
-    wd->loaded = true;
+    wd->loaded = TRUE;
     g_audioSystem.wav_cache_count++;
 
     LeaveCriticalSection(&g_audioSystem.wavLock);
-    return true;
+    return TRUE;
 }
 
 void unload_WAV(const char* filename) {
@@ -1322,14 +1421,14 @@ void unload_WAV(const char* filename) {
         // mixer never dereferences a freed buffer.
         for (int j = 0; j < MAX_WAV_SOUNDS; j++) {
             if (g_audioSystem.wav[j].wav_data == target) {
-                g_audioSystem.wav[j].active   = false;
+                g_audioSystem.wav[j].active   = FALSE;
                 g_audioSystem.wav[j].wav_data = NULL;
             }
         }
 
         free(target->data);
         target->data        = NULL;
-        target->loaded      = false;
+        target->loaded      = FALSE;
         target->filename[0] = '\0';
         g_audioSystem.wav_cache_count--;
 
@@ -1345,7 +1444,7 @@ void unload_all_WAVs(void) {
     EnterCriticalSection(&g_audioSystem.wavLock);
 
     for (int j = 0; j < MAX_WAV_SOUNDS; j++) {
-        g_audioSystem.wav[j].active   = false;
+        g_audioSystem.wav[j].active   = FALSE;
         g_audioSystem.wav[j].wav_data = NULL;
     }
 
@@ -1353,7 +1452,7 @@ void unload_all_WAVs(void) {
         if (g_audioSystem.wav_cache[i].loaded && g_audioSystem.wav_cache[i].data)
             free(g_audioSystem.wav_cache[i].data);
         g_audioSystem.wav_cache[i].data        = NULL;
-        g_audioSystem.wav_cache[i].loaded      = false;
+        g_audioSystem.wav_cache[i].loaded      = FALSE;
         g_audioSystem.wav_cache[i].filename[0] = '\0';
     }
     g_audioSystem.wav_cache_count = 0;
@@ -1411,7 +1510,7 @@ int play_repeating_WAV(int id, const char* filename, float amplitude) {
     int slot = get_or_create_wav_sound(id, wd, amplitude);
     if (slot >= 0) {
         g_audioSystem.wav[slot].fade_state = FADE_IN;
-        g_audioSystem.wav[slot].repeat     = true;
+        g_audioSystem.wav[slot].repeat     = TRUE;
     }
     LeaveCriticalSection(&g_audioSystem.wavLock);
     return slot >= 0 ? slot + 100 : -1;
@@ -1429,7 +1528,7 @@ int play_delayed_WAV_by_duration(int id, const char* filename, float amplitude,
     if (slot >= 0) {
         g_audioSystem.wav[slot].fade_state               = FADE_DELAY;
         g_audioSystem.wav[slot].delay_samples            = (int)(start_delay_seconds * SAMPLE_RATE);
-        g_audioSystem.wav[slot].is_timed_after_delay     = true;
+        g_audioSystem.wav[slot].is_timed_after_delay     = TRUE;
         g_audioSystem.wav[slot].delayed_duration_seconds = duration_seconds;
     }
     LeaveCriticalSection(&g_audioSystem.wavLock);
@@ -1448,8 +1547,8 @@ int play_delayed_repeating_WAV(int id, const char* filename, float amplitude,
     if (slot >= 0) {
         g_audioSystem.wav[slot].fade_state           = FADE_DELAY;
         g_audioSystem.wav[slot].delay_samples        = (int)(start_delay_seconds * SAMPLE_RATE);
-        g_audioSystem.wav[slot].is_timed_after_delay = false;
-        g_audioSystem.wav[slot].repeat               = true;
+        g_audioSystem.wav[slot].is_timed_after_delay = FALSE;
+        g_audioSystem.wav[slot].repeat               = TRUE;
     }
     LeaveCriticalSection(&g_audioSystem.wavLock);
     return slot >= 0 ? slot + 100 : -1;
@@ -1469,9 +1568,9 @@ int play_repeating_delayed_WAV_by_duration(int id, const char* filename, float a
     if (slot >= 0) {
         g_audioSystem.wav[slot].fade_state               = FADE_DELAY;
         g_audioSystem.wav[slot].delay_samples            = (int)(start_delay_seconds * SAMPLE_RATE);
-        g_audioSystem.wav[slot].is_timed_after_delay     = true;
+        g_audioSystem.wav[slot].is_timed_after_delay     = TRUE;
         g_audioSystem.wav[slot].delayed_duration_seconds = play_duration_seconds;
-        g_audioSystem.wav[slot].repeat                   = true;
+        g_audioSystem.wav[slot].repeat                   = TRUE;
     }
     LeaveCriticalSection(&g_audioSystem.wavLock);
     return slot >= 0 ? slot + 100 : -1;
@@ -1517,7 +1616,7 @@ int play_repeating_specific_part_WAV(int id, const char* filename, float amplitu
         g_audioSystem.wav[slot].loop_start_sample = start_sample;
         g_audioSystem.wav[slot].loop_end_sample   = end_sample;
         g_audioSystem.wav[slot].fade_state        = FADE_SUSTAIN;
-        g_audioSystem.wav[slot].repeat            = true;
+        g_audioSystem.wav[slot].repeat            = TRUE;
     }
     LeaveCriticalSection(&g_audioSystem.wavLock);
     return slot >= 0 ? slot + 100 : -1;
@@ -1532,8 +1631,8 @@ void stop_WAV(int id) {
     WavSound* sound = &g_audioSystem.wav[slot];
     if (sound->active) {
         if (sound->fade_state == FADE_DELAY || sound->paused) {
-            sound->active = false;      // silent right now — no fade needed
-            sound->paused = false;
+            sound->active = FALSE;      // silent right now — no fade needed
+            sound->paused = FALSE;
         } else if (sound->fade_state != FADE_OUT) {
             sound->fade_state   = FADE_OUT;
             sound->fade_counter = 0;
@@ -1550,8 +1649,8 @@ void stop_all_WAVs(void) {
         WavSound* sound = &g_audioSystem.wav[i];
         if (!sound->active) continue;
         if (sound->fade_state == FADE_DELAY || sound->paused) {
-            sound->active = false;
-            sound->paused = false;
+            sound->active = FALSE;
+            sound->paused = FALSE;
         } else if (sound->fade_state != FADE_OUT) {
             sound->fade_state   = FADE_OUT;
             sound->fade_counter = 0;
@@ -1581,7 +1680,7 @@ void pause_WAV(int id) {
 
     EnterCriticalSection(&g_audioSystem.wavLock);
     if (g_audioSystem.wav[slot].active)
-        g_audioSystem.wav[slot].paused = true;
+        g_audioSystem.wav[slot].paused = TRUE;
     LeaveCriticalSection(&g_audioSystem.wavLock);
 }
 
@@ -1592,7 +1691,7 @@ void resume_WAV(int id) {
 
     EnterCriticalSection(&g_audioSystem.wavLock);
     if (g_audioSystem.wav[slot].active)
-        g_audioSystem.wav[slot].paused = false;
+        g_audioSystem.wav[slot].paused = FALSE;
     LeaveCriticalSection(&g_audioSystem.wavLock);
 }
 
@@ -1619,9 +1718,9 @@ void set_fade_duration_WAV(int id, int samples) {
 }
 
 BOOL check_active_WAV(int id) {
-    if (!g_audioSystem.initialized) return false;
+    if (!g_audioSystem.initialized) return FALSE;
     int slot = wav_slot_from_id(id);
-    if (slot < 0) return false;
+    if (slot < 0) return FALSE;
 
     EnterCriticalSection(&g_audioSystem.wavLock);
     BOOL playing = g_audioSystem.wav[slot].active;

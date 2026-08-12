@@ -1,6 +1,6 @@
 #include <Windows.h>
 #include "GraphicsManager/2D/GDI/GDI.h"
-#include "InputManager/KeyboardInput.h"
+#include "InputManager/Keyboard.h"
 #include "ConsoleManager/Console.h"
 #include "ClockManager/Clock.h"
 #include "AudioManager/Audio.h"
@@ -93,16 +93,26 @@ INT WINAPI wWinMain(
 
 
     con_init();
+
+
+    INT BufferAlign = 0;
     while (1) { // Keep the program running until the user closes it
 
+        if (GetAsyncKeyState(VK_UP_)){
+            BufferAlign++;
+            Sleep(60);
+        }
+        if (GetAsyncKeyState(VK_DOWN_)){
+            BufferAlign--;
+            Sleep(60);
+        }
 
-        PlayPiano();
+        PlayPiano(BufferAlign);
 
         if (input_key_pressed(VK_ESCAPE_)) {
             break; // Exit the loop if Escape key is pressed
         }
 
-        Sleep(100); // Sleep to reduce CPU usage
     }
     con_shutdown();
     audio_shutdown(); // Clean up audio system

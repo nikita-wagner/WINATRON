@@ -582,9 +582,9 @@ if not defined DET32 if not defined DET64 (
 >> "!CF!" echo.
 >> "!CF!" echo # -- Linker Libraries -------------------------------------------
 >> "!CF!" echo #  Space-separated .lib files to link
->> "!CF!" echo #  kernel32.lib  user32.lib  gdi32.lib   shell32.lib
+>> "!CF!" echo #  kernel32.lib  user32.lib  gdi32.lib   shell32.lib   winmm.lib
 >> "!CF!" echo #  advapi32.lib  ole32.lib   ws2_32.lib  ntdll.lib
->> "!CF!" echo MSVC_LIBS=user32.lib gdi32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib ntdll.lib
+>> "!CF!" echo MSVC_LIBS=user32.lib gdi32.lib shell32.lib advapi32.lib ole32.lib ws2_32.lib ntdll.lib winmm.lib
 >> "!CF!" echo.
 >> "!CF!" echo.
 >> "!CF!" echo.

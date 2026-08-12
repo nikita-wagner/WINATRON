@@ -1,4 +1,6 @@
-#include <windows.h>
+#include <Windows.h>
+
+#define MAX_THREADS 8
 
 // Shared exit flag
 static volatile bool g_shouldExit = false;
@@ -33,7 +35,29 @@ DWORD WINAPI RenderThreadProc(LPVOID lpParam) {
     return 0;
 }
 
-int threads() {
+
+
+
+
+// SetPriorityClass(
+//     GetCurrentProcess(),
+//     REALTIME_PRIORITY_CLASS
+// );
+// 
+// SetThreadPriority(
+//     hThread,
+//     THREAD_PRIORITY_TIME_CRITICAL
+// );
+
+BOOL create_thread;
+
+
+
+
+
+
+
+int ThreadsExample() {
     
     // Create thread handles
     HANDLE consoleThread = NULL;

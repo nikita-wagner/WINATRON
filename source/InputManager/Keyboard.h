@@ -119,7 +119,7 @@ BOOL input_key_pressed(int vk) {
 
 // Are multiple keys currently held down? (variadic function)
 BOOL input_keys_held(int count, ...) {
-    va_list args;
+    CHAR*  args;
     va_start(args, count);
     for (int i = 0; i < count; i++) {
         int vk = va_arg(args, int);
