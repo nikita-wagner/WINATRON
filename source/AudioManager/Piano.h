@@ -8,6 +8,8 @@
 #include "..\InputManager\Keyboard.h"
 #include "..\ConsoleManager\Console.h"
 
+#pragma once
+
 // Returns frequency in Hz for a given MIDI key number (can be any integer).
 // Standard: MIDI note 69 = A4 = 440 Hz. Frequency formula:
 // f(n) = 440 * 2^{(n-69)/12}

@@ -117,7 +117,7 @@ typedef struct {
     // reverb delay lines live in static side arrays (see below) so this
     // struct stays ~100 bytes instead of ~17.7 KB
     BOOL   paused;
-} Tone;
+} ToneSound;
 
 typedef struct {
     short* data;
@@ -166,7 +166,7 @@ typedef struct {
     WAVEHDR          waveHeaders[NUM_BUFFERS];
     short            audioBuffers[NUM_BUFFERS][BUFFER_SIZE * 2];
     int              currentBuffer;
-    Tone             tone[MAX_TONE_SOUNDS];
+    ToneSound        tone[MAX_TONE_SOUNDS];
     WavSound         wav[MAX_WAV_SOUNDS];
     WAV              wav_cache[MAX_WAV_CACHE];
     int              wav_cache_count;
@@ -293,7 +293,7 @@ static inline void mix_stereo(short* buffer, int i,
 // ─── Sound initializers ──────────────────────────────────────────────────────
 // Both take the slot index so they can reset that slot's reverb delay line.
 
-static void init_sound_common(Tone* sound, int slot,
+static void init_sound_common(ToneSound* sound, int slot,
                               double frequency, float amplitude, double phase) {
     phase = fmod(phase, 2.0 * PI);
     if (phase < 0.0) phase += 2.0 * PI;
@@ -398,7 +398,7 @@ static void audio_mixer(short* buffer, int buffer_size) {
     g_mix_clock += buffer_size;
 
     for (int v = 0; v < MAX_TONE_SOUNDS; v++) {
-        Tone* tone = &g_audioSystem.tone[v];
+        ToneSound* tone = &g_audioSystem.tone[v];
         if (!tone->active || tone->paused) continue;
 
         int start_i = 0;
@@ -720,7 +720,7 @@ static int tone_start(int id, double frequency, float amplitude, double phase,
 
     int slot = acquire_tone_slot(id);
     if (slot >= 0) {
-        Tone* t = &g_audioSystem.tone[slot];
+        ToneSound* t = &g_audioSystem.tone[slot];
         init_sound_common(t, slot, frequency, amplitude,
                           tone_start_phase(frequency, phase, delay_samples));
 
@@ -836,7 +836,7 @@ void stop_tone(int sound_id) {
     if (!g_audioSystem.initialized || sound_id < 0 || sound_id >= MAX_TONE_SOUNDS) return;
 
     EnterCriticalSection(&g_audioSystem.toneLock);
-    Tone* sound = &g_audioSystem.tone[sound_id];
+    ToneSound* sound = &g_audioSystem.tone[sound_id];
     if (sound->active) {
         if (sound->fade_state == FADE_DELAY || sound->paused) {
             sound->active = FALSE;      // silent right now — no fade needed
@@ -854,7 +854,7 @@ void stop_all_tones(void) {
 
     EnterCriticalSection(&g_audioSystem.toneLock);
     for (int i = 0; i < MAX_TONE_SOUNDS; i++) {
-        Tone* sound = &g_audioSystem.tone[i];
+        ToneSound* sound = &g_audioSystem.tone[i];
         if (!sound->active) continue;
         if (sound->fade_state == FADE_DELAY || sound->paused) {
             sound->active = FALSE;
@@ -873,7 +873,7 @@ void angle_of_tone(int id, float angle) {
 
     if (id >= 0 && id < MAX_TONE_SOUNDS) {
         EnterCriticalSection(&g_audioSystem.toneLock);
-        Tone* sound = &g_audioSystem.tone[id];
+        ToneSound* sound = &g_audioSystem.tone[id];
         if (sound->active)
             sound->angle = angle;   // mixer recomputes left/right each buffer
         LeaveCriticalSection(&g_audioSystem.toneLock);
@@ -898,7 +898,7 @@ void reverb_tone(int id, float amount, float decay) {
 
     if (id >= 0 && id < MAX_TONE_SOUNDS) {
         EnterCriticalSection(&g_audioSystem.toneLock);
-        Tone* sound = &g_audioSystem.tone[id];
+        ToneSound* sound = &g_audioSystem.tone[id];
         if (sound->active) {
             sound->reverb_amount = amount;
             sound->reverb_decay  = decay;

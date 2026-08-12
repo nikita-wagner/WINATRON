@@ -1,6 +1,6 @@
 #include <Windows.h>
 
-
+#pragma once
 
 int width = 2560;
 int height = 1440;
