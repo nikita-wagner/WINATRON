@@ -386,14 +386,16 @@ static void con_enable_ansi(void) {
     }
 }
 
-static void new_con_init(void) {
-    AllocConsole();
+static BOOL new_con_init(void) {
+    BOOL nci = AllocConsole();
     con_enable_ansi();
+    return nci;
 }
 
-static void con_init(void) {
-    AttachConsole(ATTACH_PARENT_PROCESS);
+static BOOL con_init(void) {
+    BOOL ci = AttachConsole(ATTACH_PARENT_PROCESS);
     con_enable_ansi();
+    return ci;
 }
 
 // ─── Output ───────────────────────────────────────────────────────────────────

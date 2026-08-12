@@ -64,6 +64,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <math.h>
+#include <stdbool.h>
 #include <immintrin.h>
 #include <intrin.h>
 
@@ -172,7 +173,6 @@ typedef struct {
     int              wav_cache_count;
     BOOL             initialized;
     volatile BOOL    running;           // read by the audio thread without a lock
-    HANDLE           audioThread;
     CRITICAL_SECTION toneLock;
     CRITICAL_SECTION wavLock;
 } AudioSystem;
@@ -545,26 +545,36 @@ static void audio_mixer(short* buffer, int buffer_size) {
     LeaveCriticalSection(&g_audioSystem.wavLock);
 }
 
-// ─── Audio thread ────────────────────────────────────────────────────────────
+// ─── Audio pump ──────────────────────────────────────────────────────────────
+// Audio.h neither spawns a thread nor loops: audio_init() only sets up state,
+// and this is ONE pass over the wave-out ring — every buffer the device has
+// finished with gets re-mixed and re-queued.
+//
+// The loop that calls this lives in SoundThreadProc (ThreadManager/Threads.h),
+// so every thread's lifetime, pacing and stop condition sit together in one
+// file instead of being spread across each subsystem header.
+//
+// Must be called at least once per buffer (50 ms) or the device runs dry;
+// AUDIO_PUMP_INTERVAL_MS is the interval to pace it at. Only one thread may
+// pump at a time.
 
-static DWORD WINAPI audio_thread_proc(LPVOID lpParam) {
-    (void)lpParam;
-    while (g_audioSystem.running) {
-        for (int i = 0; i < NUM_BUFFERS; i++) {
-            WAVEHDR* header = &g_audioSystem.waveHeaders[i];
-            if ((header->dwFlags & WHDR_DONE) || !(header->dwFlags & WHDR_PREPARED)) {
-                audio_mixer(g_audioSystem.audioBuffers[i], BUFFER_SIZE);
-                if (header->dwFlags & WHDR_PREPARED)
-                    waveOutUnprepareHeader(g_audioSystem.hWaveOut, header, sizeof(WAVEHDR));
+#define AUDIO_PUMP_INTERVAL_MS 3
 
-                header->dwFlags = 0;
-                if (waveOutPrepareHeader(g_audioSystem.hWaveOut, header, sizeof(WAVEHDR)) == MMSYSERR_NOERROR)
-                    waveOutWrite(g_audioSystem.hWaveOut, header, sizeof(WAVEHDR));
-            }
+void audio_pump(void) {
+    if (!g_audioSystem.running) return;
+
+    for (int i = 0; i < NUM_BUFFERS; i++) {
+        WAVEHDR* header = &g_audioSystem.waveHeaders[i];
+        if ((header->dwFlags & WHDR_DONE) || !(header->dwFlags & WHDR_PREPARED)) {
+            audio_mixer(g_audioSystem.audioBuffers[i], BUFFER_SIZE);
+            if (header->dwFlags & WHDR_PREPARED)
+                waveOutUnprepareHeader(g_audioSystem.hWaveOut, header, sizeof(WAVEHDR));
+
+            header->dwFlags = 0;
+            if (waveOutPrepareHeader(g_audioSystem.hWaveOut, header, sizeof(WAVEHDR)) == MMSYSERR_NOERROR)
+                waveOutWrite(g_audioSystem.hWaveOut, header, sizeof(WAVEHDR));
         }
-        Sleep(3);
     }
-    return 0;
 }
 
 // ─── Init / Shutdown ─────────────────────────────────────────────────────────
@@ -634,31 +644,17 @@ BOOL audio_init(void) {
     g_audioSystem.initialized = TRUE;
     g_audioSystem.running     = TRUE;
 
-    g_audioSystem.audioThread = CreateThread(NULL, 0, audio_thread_proc, NULL, 0, NULL);
-    if (g_audioSystem.audioThread == NULL) {
-        g_audioSystem.initialized = FALSE;
-        g_audioSystem.running     = FALSE;
-        waveOutClose(g_audioSystem.hWaveOut);
-        DeleteCriticalSection(&g_audioSystem.toneLock);
-        DeleteCriticalSection(&g_audioSystem.wavLock);
-        return FALSE;
-    }
-    // keep buffer refills punctual even when the main thread is busy
-    SetThreadPriority(g_audioSystem.audioThread, THREAD_PRIORITY_TIME_CRITICAL);
-
     return TRUE;
 }
 
+// The caller must guarantee the pump loop has already stopped on whatever
+// thread was running it before calling this — audio_shutdown() tears down the
+// waveOut handle and locks that audio_pump() still reads.
 void audio_shutdown(void) {
     if (!g_audioSystem.initialized)
         return;
 
     g_audioSystem.running = FALSE;
-    if (g_audioSystem.audioThread != NULL) {
-        WaitForSingleObject(g_audioSystem.audioThread, 2000);
-        CloseHandle(g_audioSystem.audioThread);
-        g_audioSystem.audioThread = NULL;
-    }
 
     waveOutReset(g_audioSystem.hWaveOut);
 

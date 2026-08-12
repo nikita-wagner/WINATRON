@@ -1,56 +1,85 @@
+// ═══════════════════════════════════════════════════════════════════════════
+//  GDI.h — layered overlay window + 32-bit ARGB software surface
+//
+//  Threading contract — the same init / run / shutdown shape Audio.h uses:
+//
+//      gdi_init(hInstance)      acquire window, DCs and pixel buffer
+//      gdi_frame()              one frame; FALSE once the window is gone
+//      gdi_shutdown()           release everything gdi_init() acquired
+//
+//  ── All three MUST run on the SAME thread ────────────────────────────────
+//  This is the one rule that makes GDI different from audio. Win32 windows
+//  have thread affinity:
+//
+//    • messages for a window are delivered to the queue of the thread that
+//      called CreateWindowEx — no other thread's PeekMessage will ever see
+//      them, so a window created on main and pumped on a worker simply never
+//      receives anything and Windows marks it "not responding";
+//    • DestroyWindow only works when called from the owning thread;
+//    • the DC and DIB section are bound to that window.
+//
+//  So GDIThreadProc calls all three itself rather than having main create the
+//  window up front. That is the whole fix — see ThreadManager/Threads.h.
+//  gdi_init() records its own thread id and the other entry points refuse to
+//  run on a foreign thread instead of failing silently at runtime.
+//
+//  Stopping it from another thread: set *shouldExit (shared flag, same as
+//  audio), or call gdi_request_stop() which posts WM_QUIT into the GDI
+//  thread's queue — safe from any thread, unlike touching the window directly.
+//
+//  ── Pixel format ─────────────────────────────────────────────────────────
+//  One UINT32 per pixel, 0xAARRGGBB, top-down rows. UpdateLayeredWindow with
+//  AC_SRC_ALPHA needs PREMULTIPLIED colour (R,G,B already scaled by A).
+// ═══════════════════════════════════════════════════════════════════════════
+
 #include <Windows.h>
+#include <stdbool.h>
 
 #pragma once
 
-int width = 2560;
-int height = 1440;
+
+// ─── Surface state ───────────────────────────────────────────────────────────
+// One global, like g_audioSystem: the engine has a single overlay. Everything
+// gdi_init() acquires is stored here so gdi_shutdown() can actually release it
+// (the old code kept these in locals, so nothing could be freed).
+
+typedef struct {
+    HWND          hwnd;
+    HDC           hdcScreen;    // screen DC — reference DC for the DIB, and present source
+    HDC           hdcMem;       // memory DC the DIB is selected into
+    HBITMAP       hbmp;         // the DIB section
+    HBITMAP       hbmpOld;      // whatever was in hdcMem before, restored on shutdown
+    UINT32*       pixels;       // direct pointer into the DIB: width*height premultiplied ARGB
+    int           width;
+    int           height;
+    int           originX;      // surface (0,0) in virtual-desktop coords — negative on
+    int           originY;      // multi-monitor setups where a screen sits left of / above primary
+    DWORD         threadId;     // thread that owns the window; only it may pump or destroy
+    BOOL          initialized;
+    volatile BOOL running;
+} GDISystem;
+
+static GDISystem g_gdiSystem = {0};
+
+#define GDI_FRAME_SLEEP_MS 1     // yield between frames instead of burning a core
 
 
-LRESULT CALLBACK wWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+// ─── Window procedure ────────────────────────────────────────────────────────
+// The overlay is click-through (WS_EX_TRANSPARENT), so this only has to turn
+// window teardown into a WM_QUIT for our own pump.
+
+static LRESULT CALLBACK gdi_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     if (msg == WM_DESTROY) { PostQuitMessage(0); return 0; }
     return DefWindowProc(hwnd, msg, wParam, lParam);
 }
 
 
 
-static _Out_ HWND CREATE_WINDOW(_In_ HINSTANCE hInstance) {
-    // Register a window class for the overlay window
-    // Register a window class for the overlay window
-    WNDCLASS WindowClass = { 0 };
-
-
-    WindowClass.lpfnWndProc = wWndProc;
-    WindowClass.hInstance = hInstance;
-    WindowClass.lpszClassName = "OverlayWindowClass";
-    RegisterClass(&WindowClass);
-
-
-
-    // Layered + transparent (click-through) + topmost + no taskbar icon
-    HWND WindowHandle = CreateWindowEx(
-        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
-        WindowClass.lpszClassName, 
-        "", 
-        WS_POPUP,
-        0, 
-        0, 
-        width, 
-        height,
-        NULL, 
-        NULL, 
-        hInstance, 
-        NULL
-    );
-
-    return WindowHandle;
-}
-
-
-
-// Test function to generate a cycling hue color for demonstration purposes
-_Out_ UINT32 RGB_HUE() {
+// Test function to generate a cycling hue color for demonstration purposes.
+// The `tick` state is not synchronised — only the GDI thread may call this.
+static UINT32 RGB_HUE(void) {
     static FLOAT tick = 0;
-    tick += 0.0002;
+    tick += 0.0002f;
     if (tick > 0x600) tick = 0;
     UINT32 segment = ((UINT32)tick / 256) % 6;
     UINT32 t = (UINT32)tick % 256;
@@ -72,115 +101,276 @@ _Out_ UINT32 RGB_HUE() {
     return ((UINT32)0x80 << 24) | ((UINT32)r << 16) | ((UINT32)g << 8) | (UINT32)b;
 }
 
+// ─── Lifecycle: init ─────────────────────────────────────────────────────────
+// Call this ON the thread that will loop on gdi_frame(). It creates the window, so
+// that thread becomes the owner of the message queue for the rest of the run.
+//
+// The surface covers the whole virtual desktop rather than a hardcoded
+// 2560x1440: the old size was a guess, and any pixel write past the real
+// desktop bounds corrupted heap memory behind the DIB.
 
+BOOL gdi_init(_In_ HINSTANCE hInstance) {
+    if (g_gdiSystem.initialized)
+        return TRUE;
 
+    ZeroMemory(&g_gdiSystem, sizeof(GDISystem));
 
-static VOID GDI_GRAPHICS_TEST(_In_ HINSTANCE hInstance) {
-    
-    HWND WindowHandle = CREATE_WINDOW(hInstance);
+    // Report real pixels instead of a DPI-scaled virtual resolution. Must
+    // happen before the first window exists, or the overlay is stretched and
+    // cursor coordinates stop lining up with the buffer.
+    SetProcessDPIAware();
 
-    // Build a 32-bit ARGB DIB section
-    HDC hdcScreen = GetDC(NULL); // Get device context for the screen
-    HDC hdcMem = CreateCompatibleDC(hdcScreen); // Create compatible memory device context for offscreen drawing
+    g_gdiSystem.originX = GetSystemMetrics(SM_XVIRTUALSCREEN);
+    g_gdiSystem.originY = GetSystemMetrics(SM_YVIRTUALSCREEN);
+    g_gdiSystem.width   = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+    g_gdiSystem.height  = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+    if (g_gdiSystem.width <= 0 || g_gdiSystem.height <= 0)
+        return FALSE;
 
-    BITMAPINFO bmi = { 0 }; // Initialize bitmap info structure
-    bmi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER); // Set size of bitmap header
-    bmi.bmiHeader.biWidth = width; // Bitmap width in pixels
-    bmi.bmiHeader.biHeight = -height; // Negative height = top-down bitmap (y=0 at top)
-    bmi.bmiHeader.biPlanes = 1; // Always 1 for standard bitmaps
-    bmi.bmiHeader.biBitCount = 32; // 32 bits per pixel (8 bits each for ARGB)
-    bmi.bmiHeader.biCompression = BI_RGB; // No compression, raw RGB data for direct pixel access
+    // Register once per process. Re-registering the same class name returns
+    // ERROR_CLASS_ALREADY_EXISTS, which is fine — anything else is fatal.
+    static const char* GDI_CLASS_NAME = "OverlayWindowClass";
+    WNDCLASSA WindowClass  = {0};
+    WindowClass.lpfnWndProc   = gdi_wnd_proc;
+    WindowClass.hInstance     = hInstance;
+    WindowClass.lpszClassName = GDI_CLASS_NAME;
+    if (!RegisterClassA(&WindowClass) && GetLastError() != ERROR_CLASS_ALREADY_EXISTS)
+        return FALSE;
 
-    void* pixels; // Pointer to the pixel buffer (filled by CreateDIBSection)
+    // WS_EX_LAYERED     per-pixel alpha via UpdateLayeredWindow
+    // WS_EX_TRANSPARENT clicks pass through to whatever is underneath
+    // WS_EX_TOPMOST     stays above normal windows
+    // WS_EX_TOOLWINDOW  no taskbar button, no Alt-Tab entry
+    // WS_EX_NOACTIVATE  never steals focus — important now that the overlay
+    //                   lives on its own thread and could grab it at any time
+    g_gdiSystem.hwnd = CreateWindowExA(
+        WS_EX_LAYERED | WS_EX_TRANSPARENT | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE,
+        GDI_CLASS_NAME,
+        "",
+        WS_POPUP,
+        g_gdiSystem.originX,
+        g_gdiSystem.originY,
+        g_gdiSystem.width,
+        g_gdiSystem.height,
+        NULL,
+        NULL,
+        hInstance,
+        NULL
+    );
+    if (!g_gdiSystem.hwnd)
+        return FALSE;
 
-    HBITMAP hbmp = CreateDIBSection( // Create DIB and get pointer to pixel data
-        hdcScreen, 
-        &bmi, 
-        DIB_RGB_COLORS, 
-        &pixels, 
-        NULL, 
-        0
-    ); 
+    g_gdiSystem.hdcScreen = GetDC(NULL);
+    if (!g_gdiSystem.hdcScreen) { DestroyWindow(g_gdiSystem.hwnd); g_gdiSystem.hwnd = NULL; return FALSE; }
 
-    HBITMAP hOld = (HBITMAP)SelectObject(hdcMem, hbmp); // Select bitmap into memory DC, save the old one for cleanup
-
-    // Push the bitmap into the layered window via UpdateLayeredWindow
-    POINT ptSrc = { 0, 0 }; // Source coordinate in memory DC (top-left of bitmap)
-    POINT ptDst = { 0, 0 }; // Destination coordinate on screen (window position)
-    SIZE size = { width, height }; // Size of the area to copy
-    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, AC_SRC_ALPHA }; // Alpha blending: use source alpha, full opacity (255)
-
-    MSG msg = {0};
-
-    while (1) {
-        // Non-blocking message check                   // Use PM_NOYIELD for better performance, but it can starve CPU resources.
-        if (PeekMessage(&msg, NULL, 0, 0, PM_REMOVE)) { // Use PM_REMOVE while Debugging to avoid starving CPU resources.
-            if (msg.message == WM_QUIT) break;
-            TranslateMessage(&msg);
-            DispatchMessage(&msg);
-        } else {
-            // Do your drawing here when no messages are pending
-            POINT p;
-            GetCursorPos(&p);
-            memset(pixels, 0, width * height * 4);
-
-            for (int x = 1; x < width; ++x) {
-                ((UINT32*)pixels)[p.y * width + x] = 0xFFFF0000;
-            }
-            for (int y = 1; y < height; ++y) {
-                ((UINT32*)pixels)[y * width + p.x] = 0xFFFF0000;
-            }
-
-
-            // Draw empty square around cursor
-            for (int x = -50; x <= 50; ++x) {
-                int px = p.x + x;
-                int py1 = p.y - 50;
-                int py2 = p.y + 50;
-                if (px >= 0 && px < width) {
-                    if (py1 >= 0 && py1 < height) ((UINT32*)pixels)[py1 * width + px] = 0x80FF0000; // Semi-transparent red
-                    if (py2 >= 0 && py2 < height) ((UINT32*)pixels)[py2 * width + px] = 0x80FF0000; // Semi-transparent red
-                }
-            }
-            for (int y = -50; y <= 50; ++y) {
-                int py = p.y + y;
-                int px1 = p.x - 50;
-                int px2 = p.x + 50;
-                if (py >= 0 && py < height) {
-                    if (px1 >= 0 && px1 < width) ((UINT32*)pixels)[py * width + px1] = 0x80FF0000; // Semi-transparent red
-                    if (px2 >= 0 && px2 < width) ((UINT32*)pixels)[py * width + px2] = 0x80FF0000; // Semi-transparent red
-                }
-            }
-            // Draw filled square around cursor
-            for (int y = -49; y <= 49; ++y) {
-                int py = p.y + y;
-                if (py >= 0 && py < height) {
-                    for (int x = -49; x <= 49; ++x) {
-                        int px = p.x + x;
-                        if (px >= 0 && px < width) {
-                            ((UINT32*)pixels)[py * width + px] = RGB_HUE(); // Semi-transparent red
-                        }
-                    }
-                }
-            }
-
-            
-
-
-            UpdateLayeredWindow(WindowHandle, hdcScreen, &ptDst, &size, hdcMem, &ptSrc, 0, &blend, ULW_ALPHA);
-            ShowWindow(WindowHandle, SW_SHOW);
-
-            if (GetAsyncKeyState(VK_ESCAPE)) break;
-        }
+    g_gdiSystem.hdcMem = CreateCompatibleDC(g_gdiSystem.hdcScreen);
+    if (!g_gdiSystem.hdcMem) {
+        ReleaseDC(NULL, g_gdiSystem.hdcScreen);
+        DestroyWindow(g_gdiSystem.hwnd);
+        ZeroMemory(&g_gdiSystem, sizeof(GDISystem));
+        return FALSE;
     }
 
-    SelectObject(hdcMem, hOld);
-    DeleteObject(hbmp);
-    DeleteDC(hdcMem);
-    ReleaseDC(NULL, hdcScreen);
+    // Build a 32-bit ARGB DIB section
+    BITMAPINFO bmi = {0};
+    bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+    bmi.bmiHeader.biWidth       = g_gdiSystem.width;
+    bmi.bmiHeader.biHeight      = -g_gdiSystem.height;  // negative = top-down rows, y=0 at top
+    bmi.bmiHeader.biPlanes      = 1;
+    bmi.bmiHeader.biBitCount    = 32;                   // 8 bits each for A, R, G, B
+    bmi.bmiHeader.biCompression = BI_RGB;               // uncompressed: required for direct pixel writes
 
-    DestroyWindow(WindowHandle);
+    g_gdiSystem.hbmp = CreateDIBSection(
+        g_gdiSystem.hdcScreen,
+        &bmi,
+        DIB_RGB_COLORS,
+        (void**)&g_gdiSystem.pixels,
+        NULL,
+        0
+    );
+    if (!g_gdiSystem.hbmp || !g_gdiSystem.pixels) {
+        DeleteDC(g_gdiSystem.hdcMem);
+        ReleaseDC(NULL, g_gdiSystem.hdcScreen);
+        DestroyWindow(g_gdiSystem.hwnd);
+        ZeroMemory(&g_gdiSystem, sizeof(GDISystem));
+        return FALSE;
+    }
+
+    // Select the bitmap into the memory DC, keeping the old one for cleanup
+    g_gdiSystem.hbmpOld = (HBITMAP)SelectObject(g_gdiSystem.hdcMem, g_gdiSystem.hbmp);
+    SetBkMode(g_gdiSystem.hdcMem, TRANSPARENT);
+
+    g_gdiSystem.threadId    = GetCurrentThreadId();   // the owner from here on
+    g_gdiSystem.initialized = TRUE;
+    g_gdiSystem.running     = TRUE;
+
+    ShowWindow(g_gdiSystem.hwnd, SW_SHOWNOACTIVATE);
+    return TRUE;
 }
+
+
+// ─── Frame helpers ───────────────────────────────────────────────────────────
+
+// Wipe to fully transparent. Premultiplied transparent is all-zero bytes, so
+// memset is the fast path.
+static void gdi_clear(void) {
+    if (!g_gdiSystem.pixels) return;
+    memset(g_gdiSystem.pixels, 0,
+           (size_t)g_gdiSystem.width * (size_t)g_gdiSystem.height * sizeof(UINT32));
+}
+
+static BOOL gdi_in_bounds(int x, int y) {
+    return x >= 0 && y >= 0 && x < g_gdiSystem.width && y < g_gdiSystem.height;
+}
+
+// Write one pixel, ignoring out-of-bounds coordinates so callers never need
+// their own clipping.
+static void gdi_draw_pixel(int x, int y, UINT32 color) {
+    if (!g_gdiSystem.pixels || !gdi_in_bounds(x, y)) return;
+    g_gdiSystem.pixels[(size_t)y * (size_t)g_gdiSystem.width + (size_t)x] = color;
+}
+
+// Push the finished frame to the screen. The only call that touches the display.
+static BOOL gdi_present(void) {
+    if (!g_gdiSystem.hwnd) return FALSE;
+
+    POINT ptSrc = {0, 0};                                          // top-left of our bitmap
+    POINT ptDst = {g_gdiSystem.originX, g_gdiSystem.originY};      // where the window sits
+    SIZE  size  = {g_gdiSystem.width, g_gdiSystem.height};
+    BLENDFUNCTION blend = {AC_SRC_OVER, 0, 255, AC_SRC_ALPHA};     // use the bitmap's own alpha
+
+    return UpdateLayeredWindow(
+        g_gdiSystem.hwnd, g_gdiSystem.hdcScreen, &ptDst, &size,
+        g_gdiSystem.hdcMem, &ptSrc, 0, &blend, ULW_ALPHA
+    );
+}
+
+// Cursor position converted to surface-local pixels. Raw screen coordinates
+// are wrong the moment a second monitor sits left of or above the primary one
+// (origin goes negative), which is how the old code wrote outside the buffer.
+static void gdi_cursor(int* out_x, int* out_y) {
+    POINT p = {0, 0};
+    GetCursorPos(&p);
+    if (out_x) *out_x = p.x - g_gdiSystem.originX;
+    if (out_y) *out_y = p.y - g_gdiSystem.originY;
+}
+
+// Drain this thread's message queue. Returns FALSE once WM_QUIT arrives.
+// A thread owning a window that never pumps is flagged "not responding" by
+// Windows even while it is busy drawing.
+static BOOL gdi_pump(void) {
+    MSG msg;
+    while (PeekMessageA(&msg, NULL, 0, 0, PM_REMOVE)) {
+        if (msg.message == WM_QUIT) return FALSE;
+        TranslateMessage(&msg);
+        DispatchMessageA(&msg);
+    }
+    return TRUE;
+}
+
+// Ask the GDI thread to leave its frame loop. Safe to call from ANY thread —
+// posting a message is the only legal way to reach a window you do not own.
+void gdi_request_stop(void) {
+    if (g_gdiSystem.threadId)
+        PostThreadMessageA(g_gdiSystem.threadId, WM_QUIT, 0, 0);
+}
+
+// ─── Demo frame ──────────────────────────────────────────────────────────────
+// Crosshair + outlined box + hue-cycling filled box around the cursor. Every
+// write goes through gdi_draw_pixel(), which clips — the old version indexed
+// the buffer directly with raw screen coordinates and wrote out of bounds
+// whenever the cursor left the assumed 2560x1440 area.
+
+static void gdi_draw_demo_frame(void) {
+    int cx, cy;
+    gdi_cursor(&cx, &cy);
+
+    gdi_clear();
+
+    // Full-surface crosshair through the cursor
+    for (int x = 0; x < g_gdiSystem.width;  ++x) gdi_draw_pixel(x, cy, 0xFFFF0000);
+    for (int y = 0; y < g_gdiSystem.height; ++y) gdi_draw_pixel(cx, y, 0xFFFF0000);
+
+    // Outlined square around the cursor
+    for (int x = -50; x <= 50; ++x) {
+        gdi_draw_pixel(cx + x, cy - 50, 0x80FF0000);   // semi-transparent red
+        gdi_draw_pixel(cx + x, cy + 50, 0x80FF0000);
+    }
+    for (int y = -50; y <= 50; ++y) {
+        gdi_draw_pixel(cx - 50, cy + y, 0x80FF0000);
+        gdi_draw_pixel(cx + 50, cy + y, 0x80FF0000);
+    }
+
+    // Filled square, cycling hue
+    UINT32 hue = RGB_HUE();
+    for (int y = -49; y <= 49; ++y) {
+        for (int x = -49; x <= 49; ++x) gdi_draw_pixel(cx + x, cy + y, hue);
+    }
+}
+
+
+// ─── Lifecycle: frame ────────────────────────────────────────────────────────
+// ONE frame, mirroring audio_pump(): drain the message queue, draw, present.
+// Returns FALSE when the window is gone (WM_QUIT from closing it or from
+// gdi_request_stop()) and the caller should stop looping.
+//
+// The loop that calls this lives in GDIThreadProc (ThreadManager/Threads.h),
+// so thread lifetime and pacing stay in one file. Pace it with
+// GDI_FRAME_SLEEP_MS.
+//
+// Must run on the thread that called gdi_init(), because gdi_pump() only ever
+// sees messages posted to its OWN thread queue. Called anywhere else it would
+// spin forever on an empty queue while the real window stays frozen, so it
+// refuses to run rather than doing that silently.
+
+BOOL gdi_frame(void) {
+    if (!g_gdiSystem.initialized) return FALSE;
+    if (GetCurrentThreadId() != g_gdiSystem.threadId) return FALSE;
+    if (!g_gdiSystem.running) return FALSE;
+
+    if (!gdi_pump()) return FALSE;      // WM_QUIT — window closed or gdi_request_stop()
+
+    gdi_draw_demo_frame();
+    gdi_present();
+    return TRUE;
+}
+
+
+// ─── Lifecycle: shutdown ─────────────────────────────────────────────────────
+// Releases in reverse acquisition order. Like audio_shutdown(), the caller must
+// guarantee the frame loop has already stopped; and like gdi_init(), it has to be
+// the owning thread — DestroyWindow() is rejected outright when called from a
+// thread that does not own the window.
+
+void gdi_shutdown(void) {
+    if (!g_gdiSystem.initialized) return;
+    if (GetCurrentThreadId() != g_gdiSystem.threadId) return;
+
+    g_gdiSystem.running = FALSE;
+
+    if (g_gdiSystem.hdcMem && g_gdiSystem.hbmpOld) SelectObject(g_gdiSystem.hdcMem, g_gdiSystem.hbmpOld);
+    if (g_gdiSystem.hbmp)      DeleteObject(g_gdiSystem.hbmp);
+    if (g_gdiSystem.hdcMem)    DeleteDC(g_gdiSystem.hdcMem);
+    if (g_gdiSystem.hdcScreen) ReleaseDC(NULL, g_gdiSystem.hdcScreen);
+    if (g_gdiSystem.hwnd)      DestroyWindow(g_gdiSystem.hwnd);
+
+    ZeroMemory(&g_gdiSystem, sizeof(GDISystem));
+}
+
+
+// ─── Single-threaded convenience ─────────────────────────────────────────────
+// Init, loop and teardown on the caller's thread, with no exit flag — it runs
+// until the window is closed. Used by Testing.h; the threaded path is
+// GDIThreadProc in ThreadManager/Threads.h.
+
+static VOID GDI_GRAPHICS_TEST(_In_ HINSTANCE hInstance) {
+    if (!gdi_init(hInstance)) return;
+
+    while (gdi_frame()) Sleep(GDI_FRAME_SLEEP_MS);
+
+    gdi_shutdown();
+}
+
 
 
 

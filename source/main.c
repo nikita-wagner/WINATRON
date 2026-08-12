@@ -1,12 +1,5 @@
 #include <Windows.h>
-#include "GraphicsManager/2D/GDI/GDI.h"
-#include "InputManager/Keyboard.h"
-#include "ConsoleManager/Console.h"
-#include "ClockManager/Clock.h"
-#include "AudioManager/Audio.h"
-#include "AudioManager/Piano.h"
-#include "Testing/Testing.h"
-
+#include "ThreadManager/Threads.h"
 
 
 
@@ -28,8 +21,10 @@ INT WINAPI wWinMain(
 ) {
 
 
-    INT test = Testing(hInstance);
-    if (test) con_println_color(COL_RED,"test failed");
+    // INT test = Testing(hInstance);
+    // if (test) con_println_color(COL_RED,"test failed");
+
+    MainThreads(hInstance);
 
     return 0;
 }
