@@ -5,6 +5,7 @@
 #include "../ClockManager/Clock.h"
 #include "../ConsoleManager/Console.h"
 #include "../GraphicsManager/2D/GDI/GDI.h"
+#include "../UserInterfaceManger/UI.h"
 
 #pragma once
 #define MAX_THREADS 8
@@ -49,9 +50,11 @@ DWORD WINAPI ConsoleThreadProc(LPVOID lpParam) {
             return 2;
         }
     }
+    init_ui();
 
     while (!(p->shouldExit && *p->shouldExit)) {
-        Sleep(16);
+        con_move(1,1);
+
     }
 
     con_shutdown();
@@ -74,6 +77,10 @@ DWORD WINAPI SoundThreadProc(LPVOID lpParam) {
     if (!audio_init()) {
         MessageBoxA(NULL, "Failed to initialize audio system!", "Error", MB_OK | MB_ICONERROR);
         return 1;
+    }
+    if (init_Piano() < 0){
+        MessageBoxA(NULL, "Failed to initialize Piano clock System!", "Error", MB_OK | MB_ICONERROR);
+        return 2;
     }
 
     // keep buffer refills punctual even when other threads are busy
@@ -255,10 +262,16 @@ int MainThreads(HINSTANCE hInstance) {
                 for (int i = 0; i < tm.count; i++) handles[i] = tm.threads[i].handle;
                 DWORD result = WaitForMultipleObjects((DWORD)tm.count, handles, FALSE, 0); 
 
+
+
                 if (result == WAIT_TIMEOUT) continue;
                 break; // a thread finished, or WaitForMultipleObjects failed
             }
+
+           
         }
+
+
 
 
         
