@@ -24,6 +24,8 @@ static volatile bool g_shouldExit = false;
 // Clock sync means replacing a Sleep() in the loop below — nothing outside
 // Threads.h has to change.
 
+
+
 typedef struct {
     volatile bool* shouldExit;
     BOOL           new_con;     // TRUE = allocate our own console, FALSE = attach the parent's
@@ -52,9 +54,16 @@ DWORD WINAPI ConsoleThreadProc(LPVOID lpParam) {
         Sleep(16);
     }
 
-    
+    con_shutdown();
+
+
     return 0;
 }
+
+
+
+
+
 
 // Owns the audio system end to end. audio_init() only opens the device — the
 // mixing loop is right here, so this thread is the only one that ever touches
@@ -74,12 +83,17 @@ DWORD WINAPI SoundThreadProc(LPVOID lpParam) {
     while (g_audioSystem.running && !(shouldExit && *shouldExit)) {
         PlayPiano();
         audio_pump();
-        //Sleep(AUDIO_PUMP_INTERVAL_MS);   // ← Clock sync replaces this
+        Sleep(AUDIO_PUMP_INTERVAL_MS);   // ← Clock sync replaces this
     }
 
-    
+    audio_shutdown();
+
+
     return 0;
 }
+
+
+
 
 
 // A thread proc takes exactly one LPVOID, so anything needing more than the
@@ -90,7 +104,6 @@ typedef struct {
     volatile bool* shouldExit;
     HINSTANCE      hInstance;
 } GDIThreadParams;
-
 // The whole GDI lifetime lives on THIS thread — create, pump, destroy.
 // A Win32 window belongs to the thread that created it: only that thread's
 // PeekMessage sees its messages and only that thread may DestroyWindow it.
@@ -108,12 +121,20 @@ DWORD WINAPI GDIThreadProc(LPVOID lpParam) {
     // thread called gdi_request_stop().
     while (!(p->shouldExit && *p->shouldExit)) {
         if (!gdi_frame()) break;
-        //Sleep(GDI_FRAME_SLEEP_MS);       // ← Clock sync replaces this
+        Sleep(GDI_FRAME_SLEEP_MS);       // ← Clock sync replaces this
     }
 
+    gdi_shutdown();
     
+
     return 0;
 }
+
+
+
+
+
+
 
 // Stub. Same shape as the others when its system is ready:
 //     if (!render_init()) return 1;
@@ -124,6 +145,10 @@ DWORD WINAPI RenderThreadProc(LPVOID lpParam) {
     (void)shouldExit;
     return 0;
 }
+
+
+
+
 
 // ─── RAII-style thread lifecycle ─────────────────────────────────────────────
 // C has no destructors, so nothing here is automatic the way a C++ RAII
@@ -167,6 +192,10 @@ static BOOL tm_spawn(ThreadManager* tm, LPTHREAD_START_ROUTINE proc, LPVOID para
     return TRUE;
 }
 
+
+
+
+
 // Signals every managed thread to exit, waits for them, and force-terminates
 // any straggler after `timeout_ms`. Safe to call once startup only got partway
 // through (tm->count reflects only what actually got spawned).
@@ -189,6 +218,10 @@ static void tm_shutdown(ThreadManager* tm, DWORD timeout_ms) {
     for (int i = 0; i < tm->count; i++) CloseHandle(handles[i]);
     tm->count = 0;
 }
+
+
+
+
 
 // Runs the Console and Sound threads under one ThreadManager until one of
 // them exits or g_shouldExit is set from outside. Window/Render stay as
@@ -226,13 +259,11 @@ int MainThreads(HINSTANCE hInstance) {
                 break; // a thread finished, or WaitForMultipleObjects failed
             }
         }
+
+
+        
     }
     __finally {
-
-
-        con_shutdown();
-        gdi_shutdown();
-        audio_shutdown();
 
         tm_shutdown(&tm, 3000);
 
