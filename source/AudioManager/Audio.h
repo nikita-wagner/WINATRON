@@ -118,6 +118,15 @@ typedef struct {
     // reverb delay lines live in static side arrays (see below) so this
     // struct stays ~100 bytes instead of ~17.7 KB
     BOOL   paused;
+    // Auto-gain ramp (see play_tone_auto_gain_by_duration_2_steps /
+    // _3_steps). While active, amplitude is recomputed from
+    // timer_counter/timer_samples every sample and any set_amp_tone() call
+    // is overwritten on the next sample.
+    BOOL   gain_ramp_active;
+    BOOL   gain_ramp_three_step;
+    float  gain_ramp_start;
+    float  gain_ramp_mid;
+    float  gain_ramp_end;
 } ToneSound;
 
 typedef struct {
@@ -318,6 +327,11 @@ static void init_sound_common(ToneSound* sound, int slot,
     sound->reverb_amount            = 0.0f;
     sound->reverb_decay             = 0.5f;
     sound->paused                   = FALSE;
+    sound->gain_ramp_active         = FALSE;
+    sound->gain_ramp_three_step     = FALSE;
+    sound->gain_ramp_start          = 0.0f;
+    sound->gain_ramp_mid            = 0.0f;
+    sound->gain_ramp_end            = 0.0f;
 
     memset(reverb_bufs_tone[slot], 0, REVERB_BUF_LEN * sizeof(short));
     reverb_idx_tone[slot] = 0;
@@ -415,6 +429,25 @@ static void audio_mixer(short* buffer, int buffer_size) {
         calculate_stereo_amplitudes(tone->angle, &tone->left_amp, &tone->right_amp);
 
         for (int i = start_i; i < buffer_size; i++) {
+            if (tone->gain_ramp_active) {
+                float progress = (tone->timer_samples > 0)
+                    ? (float)tone->timer_counter / (float)tone->timer_samples : 1.0f;
+                if (progress > 1.0f) progress = 1.0f;
+
+                if (tone->gain_ramp_three_step) {
+                    // first half: start -> mid, second half: mid -> end
+                    if (progress < 0.5f)
+                        tone->amplitude = tone->gain_ramp_start +
+                            (tone->gain_ramp_mid - tone->gain_ramp_start) * (progress * 2.0f);
+                    else
+                        tone->amplitude = tone->gain_ramp_mid +
+                            (tone->gain_ramp_end - tone->gain_ramp_mid) * ((progress - 0.5f) * 2.0f);
+                } else {
+                    tone->amplitude = tone->gain_ramp_start +
+                                      (tone->gain_ramp_end - tone->gain_ramp_start) * progress;
+                }
+            }
+
             float sample = fast_sin(tone->phase) * tone->amplitude * AMPLITUDE;
             tone->phase += phase_inc;
             if (tone->phase >= 2.0 * PI) tone->phase -= 2.0 * PI;
@@ -703,12 +736,22 @@ static inline int clamp_buffer_pos(int buffer_pos) {
     return buffer_pos;
 }
 
-// Single entry point behind every play_*_tone function.
+// Core entry point behind every play_*_tone function.
 //   delay_samples : frames of silence before the tone is audible — this is
 //                   where both start delays and buffer alignment land.
 //   timed         : fade out after duration_seconds of audible playback.
-static int tone_start(int id, double frequency, float amplitude, double phase,
-                      BOOL timed, double duration_seconds, int delay_samples) {
+//   gain_ramp     : if set, amplitude follows a ramp across duration_seconds
+//                   instead of staying constant (see
+//                   play_tone_auto_gain_by_duration_2_steps / _3_steps).
+//                   Requires timed = TRUE; the initial slot amplitude is
+//                   seeded to gain_start so there is no jump before the
+//                   mixer's first ramp update.
+//   three_step    : gain_start -> gain_mid -> gain_end instead of a single
+//                   gain_start -> gain_end ramp. Ignored when !gain_ramp.
+static int tone_start_ex(int id, double frequency, float amplitude, double phase,
+                         BOOL timed, double duration_seconds, int delay_samples,
+                         BOOL gain_ramp, float gain_start, float gain_end,
+                         BOOL three_step, float gain_mid) {
     if (!g_audioSystem.initialized) return -1;
     if (delay_samples < 0) delay_samples = 0;
 
@@ -717,8 +760,14 @@ static int tone_start(int id, double frequency, float amplitude, double phase,
     int slot = acquire_tone_slot(id);
     if (slot >= 0) {
         ToneSound* t = &g_audioSystem.tone[slot];
-        init_sound_common(t, slot, frequency, amplitude,
+        init_sound_common(t, slot, frequency, gain_ramp ? gain_start : amplitude,
                           tone_start_phase(frequency, phase, delay_samples));
+
+        t->gain_ramp_active     = gain_ramp;
+        t->gain_ramp_three_step = three_step;
+        t->gain_ramp_start      = gain_start;
+        t->gain_ramp_mid        = gain_mid;
+        t->gain_ramp_end        = gain_end;
 
         if (delay_samples > 0) {
             t->fade_state               = FADE_DELAY;
@@ -733,6 +782,12 @@ static int tone_start(int id, double frequency, float amplitude, double phase,
 
     LeaveCriticalSection(&g_audioSystem.toneLock);
     return slot;
+}
+
+static int tone_start(int id, double frequency, float amplitude, double phase,
+                      BOOL timed, double duration_seconds, int delay_samples) {
+    return tone_start_ex(id, frequency, amplitude, phase, timed, duration_seconds,
+                         delay_samples, FALSE, 0.0f, 0.0f, FALSE, 0.0f);
 }
 
 int play_tone(double frequency, float gain) {
@@ -757,6 +812,44 @@ int play_delayed_static_tone(int id, double frequency, float amplitude, double p
                              double start_delay_seconds) {
     return tone_start(id, frequency, amplitude, phase, FALSE, 0.0,
                       (int)(start_delay_seconds * SAMPLE_RATE));
+}
+
+// ─── Auto-gain tone starts ───────────────────────────────────────────────────
+// Plays a tone for duration_seconds while its gain follows a ramp instead of
+// staying constant. There is no separate attack fade-in — the tone starts
+// immediately at start_gain — and after duration_seconds it releases exactly
+// like play_tone_by_duration. Calling set_amp_tone() on the id while the ramp
+// is active has no lasting effect: the next mixed sample overwrites it.
+//
+// All of these take an explicit id (0..MAX_TONE_SOUNDS-1) instead of
+// auto-picking a slot, same as play_static_tone. Pass a stable id per voice
+// (e.g. a piano key index) so retriggering that voice restarts its own slot
+// instead of grabbing a fresh one each call — calling one of these every
+// frame a key is held with id = -1 spawns a new overlapping tone per frame.
+//
+//   _2_steps : linear ramp start_gain -> end_gain across the whole duration.
+//   _3_steps : start_gain -> mid_gain over the first half of duration_seconds,
+//              then mid_gain -> end_gain over the second half — e.g.
+//              0.1 -> 0.5 -> 0.1 for a swell that comes back down.
+
+int play_tone_auto_gain_by_duration_2_steps(int id, double frequency, double duration_seconds,
+                                            float start_gain, float end_gain) {
+    return tone_start_ex(id, frequency, start_gain, 0.0, TRUE, duration_seconds, 0,
+                         TRUE, start_gain, end_gain, FALSE, 0.0f);
+}
+
+int play_delayed_tone_auto_gain_by_duration_2_steps(int id, double frequency, double duration_seconds,
+                                                     float start_gain, float end_gain,
+                                                     double start_delay_seconds) {
+    return tone_start_ex(id, frequency, start_gain, 0.0, TRUE, duration_seconds,
+                         (int)(start_delay_seconds * SAMPLE_RATE),
+                         TRUE, start_gain, end_gain, FALSE, 0.0f);
+}
+
+int play_tone_auto_gain_by_duration_3_steps(int id, double frequency, double duration_seconds,
+                                            float start_gain, float mid_gain, float end_gain) {
+    return tone_start_ex(id, frequency, start_gain, 0.0, TRUE, duration_seconds, 0,
+                         TRUE, start_gain, end_gain, TRUE, mid_gain);
 }
 
 // ─── Buffer-aligned tone starts ──────────────────────────────────────────────

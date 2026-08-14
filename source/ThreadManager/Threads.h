@@ -50,11 +50,13 @@ DWORD WINAPI ConsoleThreadProc(LPVOID lpParam) {
             return 2;
         }
     }
-    init_ui();
 
+    
+    init_ui(); // init ui fps clock
     while (!(p->shouldExit && *p->shouldExit)) {
+        clock_sync(ClockUI);
         con_move(1,1);
-
+        show_fps_con();
     }
 
     con_shutdown();
