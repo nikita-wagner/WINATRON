@@ -3,8 +3,8 @@
 #include "../InputManager/Keyboard.h"
 #include "../ConsoleManager/Console.h"
 #include "../ClockManager/Clock.h"
-#include "../AudioManager/Audio.h"
-#include "../AudioManager/Piano.h"
+#include "../AudioManager/WINMM/winmm.h"
+#include "../AudioManager/WINMM/Piano.h"
 
 #pragma once
 

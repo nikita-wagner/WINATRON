@@ -1,7 +1,7 @@
 // Create Virtual Piano Set
 
 
-#include "Audio.h"
+#include "winmm.h"
 #include <Windows.h>
 #include <math.h>
 #include <stdio.h>
@@ -42,7 +42,7 @@ static void PlayPiano(){
                         }
             }
 
-            if (input_key_held(vk) && !input_key_held(VK_SPACE_)){
+            if (input_key_held(vk) && input_key_held(VK_SHIFT_)){
                 if (vk >= VK_NUMPAD0_ && vk <= VK_NUMPAD9_) play_tone_by_duration(vk, midi(vk),0.2,0,0.1);        // A-Z
                     if(clock_sync(ClockPiano)){
                         char str[32]; // Ensure the buffer is large enough

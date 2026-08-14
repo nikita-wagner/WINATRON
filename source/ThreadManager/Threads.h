@@ -1,7 +1,7 @@
 #include <Windows.h>
 #include <stdbool.h>
-#include "../AudioManager/Audio.h"
-#include "../AudioManager/Piano.h"
+#include "../AudioManager/WINMM/winmm.h"
+#include "../AudioManager/WINMM/Piano.h"
 #include "../ClockManager/Clock.h"
 #include "../ConsoleManager/Console.h"
 #include "../GraphicsManager/2D/GDI/GDI.h"
