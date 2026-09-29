@@ -10,8 +10,8 @@ static void init_ui(){
 }
 
 static void show_fps_con(){
-    double get_fps = clock_get_fps(ClockUI);
-    char str[32];
-    snprintf(str, sizeof(str), "%.1f FPS", get_fps);
-    con_println_color(COL_RED, str);
+    // double get_fps = clock_get_fps(ClockUI);
+    // char str[32];
+    // snprintf(str, sizeof(str), "%.1f FPS", get_fps);
+    // con_println_color(COL_RED, str);
 }

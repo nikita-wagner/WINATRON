@@ -3,6 +3,7 @@
 #include <Windows.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include "..\ConsoleManager\Console.h"
 
 // Test
 // ─── Virtual Key Codes ────────────────────────────────────────────────────────
@@ -134,28 +135,33 @@ BOOL input_keys_held(int count, ...) {
 
 
 void input_print_keys(void) {
-    printf("Held keys:");
+    con_println("Held keys:");
     // Check printable range + common special keys
     for (int vk = 0x08; vk <= 0xFF; vk++) {
         if (input_key_held(vk)) {
             // Try to print a readable name for common keys
-            if (vk >= 0x41 && vk <= 0x5A)      printf(" %c", vk);        // A-Z
-            else if (vk >= 0x30 && vk <= 0x39)  printf(" %c", vk);        // 0-9
-            else if (vk == 0x20) printf(" SPACE");
-            else if (vk == 0x0D) printf(" ENTER");
-            else if (vk == 0x1B) printf(" ESC");
-            else if (vk == 0x09) printf(" TAB");
-            else if (vk == 0x10) printf(" SHIFT");
-            else if (vk == 0x11) printf(" CTRL");
-            else if (vk == 0x12) printf(" ALT");
-            else if (vk == 0x08) printf(" BKSP");
-            else if (vk == 0x25) printf(" LEFT");
-            else if (vk == 0x26) printf(" UP");
-            else if (vk == 0x27) printf(" RIGHT");
-            else if (vk == 0x28) printf(" DOWN");
-            else if (vk >= 0x70 && vk <= 0x7B) printf(" F%d", vk - 0x6F);
-            else printf(" 0x%02X", vk);
+            
+            
+            con_move(8,vk+1);
+            if (vk >= 0x41 && vk <= 0x5A)       con_printf(" %c", vk);        // A-Z
+
+            else if (vk >= 0x30 && vk <= 0x39)  con_printf(" %c", vk);        // 0-9
+            else if (vk == 0x20) con_println(" SPACE");
+            else if (vk == 0x0D) con_println(" ENTER");
+            else if (vk == 0x1B) con_println(" ESC");
+            else if (vk == 0x09) con_println(" TAB");
+            else if (vk == 0x10) con_println(" SHIFT");
+            else if (vk == 0x11) con_println(" CTRL");
+            else if (vk == 0x12) con_println(" ALT");
+            else if (vk == 0x08) con_println(" BKSP");
+            else if (vk == 0x25) con_println(" LEFT");
+            else if (vk == 0x26) con_println(" UP");
+            else if (vk == 0x27) con_println(" RIGHT");
+            else if (vk == 0x28) con_println(" DOWN");
+            
+            else if (vk >= 0x70 && vk <= 0x7B) con_printf(" F%d", vk - 0x6F);
+            else con_printf(" 0x%02X", vk);
         }
     }
-    printf("\n");
+    con_print("\n");
 }

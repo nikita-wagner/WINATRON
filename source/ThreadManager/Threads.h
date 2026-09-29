@@ -57,6 +57,7 @@ DWORD WINAPI ConsoleThreadProc(LPVOID lpParam) {
         clock_sync(ClockUI);
         con_move(1,1);
         show_fps_con();
+
     }
 
     con_shutdown();
@@ -250,7 +251,7 @@ int MainThreads(HINSTANCE hInstance) {
 
         if (!tm_spawn(&tm, ConsoleThreadProc, (LPVOID)&consoleParams, "Console")) return 2;
         if (!tm_spawn(&tm, SoundThreadProc,   (LPVOID)&g_shouldExit,  "Sound"))   return 3;
-        if (!tm_spawn(&tm, GDIThreadProc,     (LPVOID)&gdiParams,     "GDI"))     return 4;
+        //if (!tm_spawn(&tm, GDIThreadProc,     (LPVOID)&gdiParams,     "GDI"))     return 4;
 
 
         HANDLE handles[MAX_THREADS];
